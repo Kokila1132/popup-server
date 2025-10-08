@@ -1,144 +1,149 @@
-import express from "express";
-import { google } from "googleapis";
-import axios from "axios";
-import nodemailer from "nodemailer";
-import cors from "cors";
-import dotenv from "dotenv";
+import express from 'express';
+import axios from 'axios';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+import { google } from 'googleapis';
 
-dotenv.config(); // Load .env file
+dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-
-// --- Load Environment Variables ---
-const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
-const SHOPIFY_STORE_URL = process.env.SHOPIFY_STORE_URL;
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
-
-// Process private key correctly (\n replacement)
-const GOOGLE_PRIVATE_KEY_ESCAPED = process.env.GOOGLE_PRIVATE_KEY;
-const GOOGLE_PRIVATE_KEY = GOOGLE_PRIVATE_KEY_ESCAPED
-  ? GOOGLE_PRIVATE_KEY_ESCAPED.replace(/\\n/g, "\n")
-  : null;
-
-const GMAIL_USER = process.env.GMAIL_USER;
-const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
-
-// --- Middleware ---
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 app.use(cors());
+app.use(express.json());
 
-// --- Google Sheets Auth ---
-const auth = new google.auth.GoogleAuth({
-  credentials: {
-    client_email: GOOGLE_CLIENT_EMAIL,
-    private_key: GOOGLE_PRIVATE_KEY,
-  },
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
-const sheets = google.sheets({ version: "v4", auth });
+const PORT = process.env.PORT || 3000;
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+const SHOPIFY_STORE_URL = process.env.SHOPIFY_STORE_URL;
+const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
-// --- Nodemailer Setup ---
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: GMAIL_USER,
-    pass: GMAIL_APP_PASSWORD,
-  },
-});
+// Helper: normalize phone (India example)
+function formatPhone(phone) {
+  if (!phone) return '';
+  let cleaned = String(phone).trim().replace(/[^\d+]/g, '');
+  if (/^\d{10}$/.test(cleaned)) return '+91' + cleaned;
+  if (/^91\d{10}$/.test(cleaned)) return '+' + cleaned;
+  if (cleaned.startsWith('+')) return cleaned;
+  return cleaned;
+}
 
-// --- Route: Popup Capture ---
-app.post("/popup-capture", async (req, res) => {
-  const { email, phone, discount } = req.body;
-
-  if (!email || !phone || !discount) {
-    return res
-      .status(400)
-      .send("Missing required fields: email, phone, or discount.");
-  }
-
+// --- GOOGLE AUTH SETUP ---
+let googleAuth;
+async function initGoogleAuth() {
   try {
-    // 1. Shopify: Create Customer
-    if (SHOPIFY_ACCESS_TOKEN && SHOPIFY_STORE_URL) {
-      const shopifyResponse = await axios.post(
-        `${SHOPIFY_STORE_URL}/admin/api/2023-04/customers.json`,
-        {
-          customer: {
-            email: email,
-            phone: phone,
-            tags: discount,
-            accepts_marketing: true,
-          },
-        },
-        {
-          headers: {
-            "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-            "Content-Type": "application/json",
-          },
-        }
-      );
-      console.log("Shopify Customer Created:", shopifyResponse.data.customer.id);
-    } else {
-      console.warn("⚠️ Shopify credentials missing, skipping Shopify step.");
+    let credentials = null;
+
+    if (process.env.GOOGLE_CREDENTIALS_FILE) {
+      const p = path.isAbsolute(process.env.GOOGLE_CREDENTIALS_FILE)
+        ? process.env.GOOGLE_CREDENTIALS_FILE
+        : path.join(process.cwd(), process.env.GOOGLE_CREDENTIALS_FILE);
+      if (fs.existsSync(p)) credentials = JSON.parse(fs.readFileSync(p, 'utf8'));
     }
 
-    // 2. Google Sheets: Save Data
-    if (!SPREADSHEET_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) {
-      console.error("Google Sheets credentials missing.");
-      return res
-        .status(500)
-        .send({ message: "Internal Server Error: Google Sheets missing." });
+    if (!credentials && process.env.GOOGLE_CLIENT_EMAIL && process.env.GOOGLE_PRIVATE_KEY) {
+      credentials = {
+        client_email: process.env.GOOGLE_CLIENT_EMAIL,
+        private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      };
     }
 
-    const date = new Date().toLocaleString();
-    const sheetData = [[email, phone, discount, date, "Pending"]];
+    if (!credentials) return null;
 
-    await auth.getClient(); // verify auth
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: "Sheet1!A:E", // Adjusted for 5 columns
-      valueInputOption: "USER_ENTERED",
-      requestBody: { values: sheetData },
+    googleAuth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
 
-    console.log("✅ Data saved to Google Sheet.");
+    const client = await googleAuth.getClient();
+    await client.getAccessToken();
+    return google.sheets({ version: 'v4', auth: googleAuth });
+  } catch (err) {
+    console.error('Sheets Auth Error:', err);
+    return null;
+  }
+}
 
-    // 3. Email: Send Discount Code
-    if (GMAIL_USER && GMAIL_APP_PASSWORD) {
-      const mailOptions = {
-        from: GMAIL_USER,
-        to: email,
-        subject: "Your Exclusive Discount Code!",
-        text: `Thank you for signing up! 🎉 Use your code: ${discount}`,
-      };
+let sheetsClientPromise = initGoogleAuth().then((sheets) => sheets);
 
-      await transporter.sendMail(mailOptions);
-      console.log("📧 Email sent to:", email);
-    } else {
-      console.warn("⚠️ Gmail credentials missing, skipping email.");
-    }
+// --- Main route ---
+app.post('/popup-capture', async (req, res) => {
+  const payload = req.body || {};
+  const email = payload.email || payload.customer?.email;
+  const phoneRaw = payload.phone || payload.customer?.phone || payload.customer?.phone_number || payload.mobile;
+  const discount = payload.discount || '5% OFF';
 
-    // 4. Final Response
-    res
-      .status(200)
-      .send({ message: "Success! Customer, Sheet, and Email processed." });
-  } catch (error) {
-    console.error("❌ Error in /popup-capture:", error);
+  if (!email) return res.status(400).json({ success: false, message: 'Email required' });
 
-    if (error.response?.data) {
-      return res.status(500).send({
-        message: "API Error",
-        details: error.response.data,
+  const phone = formatPhone(phoneRaw);
+
+  try {
+    // 1) Shopify: find customer by email
+    let shopifyCustomer = null;
+    try {
+      const searchUrl = `${SHOPIFY_STORE_URL.replace(/\/$/, '')}/admin/api/2023-04/customers/search.json?query=email:${encodeURIComponent(email)}`;
+      const findResp = await axios.get(searchUrl, {
+        headers: {
+          'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000,
       });
+      shopifyCustomer = findResp.data?.customers?.[0] || null;
+    } catch (err) {
+      console.warn('Shopify search error:', err.response?.data || err.message);
     }
 
-    res.status(500).send({ message: `Internal Error: ${error.message}` });
+    if (shopifyCustomer) {
+      if (phone && shopifyCustomer.phone !== phone) {
+        try {
+          await axios.put(
+            `${SHOPIFY_STORE_URL.replace(/\/$/, '')}/admin/api/2023-04/customers/${shopifyCustomer.id}.json`,
+            { customer: { id: shopifyCustomer.id, phone } },
+            { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+          );
+        } catch (upErr) {
+          console.warn('Shopify update phone error:', upErr.response?.data || upErr.message);
+        }
+      }
+    } else {
+      try {
+        const createResp = await axios.post(
+          `${SHOPIFY_STORE_URL.replace(/\/$/, '')}/admin/api/2023-04/customers.json`,
+          { customer: { first_name: email.split('@')[0], email, phone: phone || undefined, accepts_marketing: true, tags: discount } },
+          { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+        );
+        shopifyCustomer = createResp.data?.customer || null;
+      } catch (createErr) {
+        console.warn('Shopify create error:', createErr.response?.data || createErr.message);
+      }
+    }
+
+    // 2) Google Sheets append
+    const sheets = await sheetsClientPromise;
+    if (sheets) {
+      try {
+        await sheets.spreadsheets.values.append({
+          spreadsheetId: SPREADSHEET_ID,
+          range: 'Sheet1!A:D',
+          valueInputOption: 'USER_ENTERED',
+          requestBody: {
+            values: [[email, phone || '', discount, new Date().toLocaleString()]],
+          },
+        });
+      } catch (sheetErr) {
+        console.error('Sheets write error', sheetErr?.response?.data || sheetErr.message);
+      }
+    }
+
+    // ✅ Mail send removed
+
+    return res.json({ success: true, message: 'Data saved successfully', shopifyCustomer });
+  } catch (err) {
+    console.error('Unhandled error:', err?.response?.data || err.message || err);
+    return res.status(500).json({ success: false, message: 'Server error', details: err?.response?.data || err.message });
   }
 });
 
-// --- Start Server ---
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+app.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
